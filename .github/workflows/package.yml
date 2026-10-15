@@ -1,0 +1,67 @@
+name: Package TalkFlow
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New version, such as 0.2.1
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: talkflow-release
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Validate version
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must use major.minor.patch.' }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: MiMat82/Talkflow
+          ref: main
+          path: source
+          ssh-key: ${{ secrets.TALKFLOW_SOURCE_READ_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: source/global.json
+      - name: Restore previous published packages for deltas
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list previous releases.' }
+          if ($tag) {
+            New-Item -ItemType Directory -Force source/artifacts/releases | Out-Null
+            gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern '*-full.nupkg' --pattern 'releases.*.json' --dir source/artifacts/releases
+            if ($LASTEXITCODE -ne 0) { throw 'Could not restore previous packages.' }
+          }
+      - name: Build, test and package
+        shell: pwsh
+        working-directory: source
+        run: ./scripts/Package-Release.ps1 -Version $env:RELEASE_VERSION -Provider github -FeedUrl "https://github.com/$env:GITHUB_REPOSITORY"
+      - name: Check updater framework
+        shell: pwsh
+        working-directory: source
+        run: dotnet run --project tests/TalkFlow.UpdateProbe/TalkFlow.UpdateProbe.csproj -c Release --no-build -- artifacts/validation/update-framework-validation.json
+      - name: Create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem source/artifacts/releases -File | Where-Object {
+            $_.Name -match [regex]::Escape($env:RELEASE_VERSION) -or $_.Name -match '^(releases|assets)\..*\.json$|^RELEASES(-|$)|Setup\.exe$|Portable\.zip$'
+          } | ForEach-Object FullName)
+          if ($assets.Count -lt 3) { throw 'Expected installer, package and feed assets.' }
+          $sourceCommit = git -C source rev-parse HEAD
+          "TalkFlow $env:RELEASE_VERSION. Built from private source commit $sourceCommit. Review and test before publishing." | Set-Content release-notes.md -Encoding utf8
+          gh release create "v$env:RELEASE_VERSION" @assets --repo $env:GITHUB_REPOSITORY --draft --title "TalkFlow $env:RELEASE_VERSION" --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
